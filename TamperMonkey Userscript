@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dealertrack RO - Notes & Promise Time Panel
 // @namespace    https://www.dealertrackdms.app.coxautoinc.com/
-// @version      2.3
+// @version      2.4
 // @description  Floating left-edge panel with Notes, Promise Time, Promise Date, Wait Time for the open RO, plus an "All ROs" list and an Archive tab (RO number, name, promise time, promise date), filterable by service writer. Shared between users through a Google Sheet backend. Records the store (dealer) each RO belongs to.
 // @match        https://*.dealertrackdms.app.coxautoinc.com/dtdms*
 // @grant        GM_setValue
@@ -201,6 +201,18 @@
     return filterWriter === '__other__' ? id === null : id === filterWriter;
   }
 
+  function normStore(str) {
+    return cleanText(str).replace(/\s+/g, ' ').toUpperCase();
+  }
+
+  // Lists show only the store you're in. ROs saved before store tracking (blank
+  // store) are still shown so they can be opened/archived; opening one tags it.
+  // If no store has been detected yet, everything is shown.
+  function matchesStoreFilter(row, store) {
+    if (!store || !row.store) return true;
+    return normStore(row.store) === normStore(store);
+  }
+
   function parseDtdmsTimestamp(rawText) {
     const text = cleanText(rawText);
     const match = text.match(
@@ -320,6 +332,7 @@
   let activeView = 'ro'; // 'ro' | 'list' | 'archive'
   let filterWriter = ''; // '' = all, an advisor id, or '__other__'
   let roOnScreen = false; // true only while an RO number field is present on this screen
+  let lastListStore = null; // store the lists were last filtered by
   const dirtyFields = new Set(); // form fields the user has actually edited since the last save
   const FORM_FIELDS = { notes: '#tm-notes', promiseTime: '#tm-promise-time', promiseDate: '#tm-promise-date' };
   try {
@@ -538,7 +551,7 @@
   }
 
   // Collect stored ROs: archived === false -> active list, true -> archive.
-  function listAllROs(archived) {
+  function listAllROs(archived, store) {
     let keys = [];
     try {
       keys = GM_listValues().filter((k) => k.startsWith(STORAGE_PREFIX));
@@ -569,6 +582,7 @@
         };
       })
       .filter((r) => r.archived === archived)
+      .filter((r) => matchesStoreFilter(r, store))
       .filter(matchesWriterFilter);
 
     if (archived) {
@@ -593,17 +607,19 @@
     const host = panel.querySelector('#tm-view-list');
     host.textContent = '';
 
-    const rows = listAllROs(isArchive);
+    const store = getStoreName();
+    const rows = listAllROs(isArchive, store);
+    const storeNote = store ? ` for ${store}` : '';
 
     if (!rows.length) {
       host.appendChild(
         el(
           'div',
           filterWriter
-            ? 'No repair orders match this service writer.'
+            ? `No repair orders match this service writer${storeNote}.`
             : isArchive
-            ? 'No archived repair orders.'
-            : 'No repair orders saved yet. Open an RO and it will appear here.',
+            ? `No archived repair orders${storeNote}.`
+            : `No repair orders saved yet${storeNote}. Open an RO and it will appear here.`,
           'color:#777; padding:6px 0;'
         )
       );
@@ -655,7 +671,9 @@
     host.appendChild(
       el(
         'div',
-        `${rows.length} RO${rows.length === 1 ? '' : 's'}` + (isArchive ? '' : ' • red = past promise time'),
+        (store ? store + ' • ' : 'Store not detected - showing all stores • ') +
+          `${rows.length} RO${rows.length === 1 ? '' : 's'}` +
+          (isArchive ? '' : ' • red = past promise time'),
         'color:#777; font-size:11px; padding-top:6px;'
       )
     );
@@ -1067,6 +1085,10 @@
 
     // Keep the "last store seen" up to date even on non-RO screens / the header frame.
     const store = getStoreName();
+    if (store !== lastListStore) {
+      lastListStore = store;
+      refreshList(); // switched stores -> re-filter the lists
+    }
 
     const ro = getRONumber();
     roOnScreen = !!ro;
