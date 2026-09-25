@@ -1,0 +1,1127 @@
+// ==UserScript==
+// @name         Dealertrack RO - Notes & Promise Time Panel
+// @namespace    https://www.dealertrackdms.app.coxautoinc.com/
+// @version      2.3
+// @description  Floating left-edge panel with Notes, Promise Time, Promise Date, Wait Time for the open RO, plus an "All ROs" list and an Archive tab (RO number, name, promise time, promise date), filterable by service writer. Shared between users through a Google Sheet backend. Records the store (dealer) each RO belongs to.
+// @match        https://*.dealertrackdms.app.coxautoinc.com/dtdms*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_listValues
+// @grant        GM_xmlhttpRequest
+// @connect      script.google.com
+// @connect      script.googleusercontent.com
+// @connect      accounts.google.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  // ---------------------------------------------------------------------
+  // CONFIG
+  // ---------------------------------------------------------------------
+  // >>> SHARED DATABASE SETTINGS - fill in ONCE, then give everyone this same file <<<
+  // (See Code.gs for the backend. Leave API_URL as-is to run in local-only mode.)
+  // API_URL is either the Apps Script "Web app" URL (ends in /exec) or your own server.js address
+  // (e.g. 'http://192.168.1.50:8787/' - if so, also add a header line: // @connect      192.168.1.50).
+  const API_URL = 'https://script.google.com/a/macros/blautogroup.com/s/AKfycbyHeEwP5GBp39LcRIp5SIz7FzEMqAJXP4GK1z6SABO7/dev';
+  // Optional - leave EMPTY for the Google setup (Google sign-in is the security there).
+  // Only fill this in if you run server.js with an API_KEY.
+  const API_KEY = '';
+  const SYNC_MS = 30000; // how often to pull coworkers' changes
+
+  // Fields that are shared. (checkIn* and archive fields are merged by rules on the server.)
+  const SYNC_FIELDS = ['name', 'writer', 'store', 'notes', 'promiseTime', 'promiseDate', 'checkInTime', 'checkInSource', 'archived', 'archivedAt'];
+  // Per-browser (NOT shared) keys; deliberately outside STORAGE_PREFIX.
+  const USER_KEY = 'ro-panel-user';
+  const OUTBOX_KEY = 'ro-panel-outbox';
+  const MIGRATED_KEY = 'ro-panel-migrated';
+  const STORE_KEY = 'ro-panel-store'; // last store seen in this browser (shared across frames)
+
+  const STORAGE_PREFIX = 'ro-extra-data-';
+  const PANEL_ID = 'tm-ro-panel';
+  const POLL_MS = 1500;
+
+  const RO_SELECTORS = ['[id="$HRO#2"]', '[id="$HRO#"]'];
+  const EVENT_LOG_GRID_SELECTOR = '[id="SD1525DA"]';
+  const CUSTOMER_SELECTOR = '[id="$CNAME"]';
+  const VEHICLE_SELECTOR = '[id="$VDESC"]';
+
+  // Store name in the app header (e.g. "ELGIN HYUNDAI"). It is rendered by a Lit
+  // web component, so it may live inside a shadow root and/or the top frame.
+  const DEALER_SELECTOR = '[data-testid="dealer-label"]';
+  const STORE_SCAN_MS = 5000; // how often to re-search for it when not found
+
+  const NARROW_W = '260px';
+  const WIDE_W = '460px';
+
+  // Service Writer field on the RO screen. Text is truncated by the app
+  // (e.g. "NICOLUSSI, ANTH"), so we match it to the full names below by prefix.
+  const WRITER_SELECTOR = '[id="$SWNAM"]';
+  const FILTER_KEY = 'ro-panel-writer-filter'; // deliberately NOT under STORAGE_PREFIX
+
+  const SERVICE_WRITERS = [
+    { id: '629', name: 'ANDERSON, ROBIN' },
+    { id: '245', name: 'Almaraz, Alejandro' },
+    { id: '111', name: 'BDC AGENT' },
+    { id: '557', name: 'Benjamin Angarola' },
+    { id: '999', name: 'DTDMS SUPPORT' },
+    { id: '310', name: 'GRANADOS, ANDY' },
+    { id: '471', name: 'IDA SZYMASZEK' },
+    { id: '718', name: 'JOHNNY WALKER IV' },
+    { id: '336', name: 'JORGE QUEVEDO' },
+    { id: '181', name: 'JOSE REYNOSO' },
+    { id: '462', name: 'KC, ROHAN' },
+    { id: '472', name: 'Kamil Karpowicz' },
+    { id: '151', name: 'MCCARTHY, MICHAEL' },
+    { id: '589', name: 'NICOLUSSI, ANTHONY' },
+    { id: 'OFF', name: 'OFFICE' },
+    { id: '904', name: 'Oliver, Ben' },
+    { id: '680', name: 'Ryder, Shane' },
+    { id: '799', name: 'TIM OLSON' },
+  ];
+
+  // ---------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------
+  function cleanText(str) {
+    if (!str) return '';
+    return str.replace(/ /g, ' ').trim();
+  }
+
+  function getFieldText(selectors) {
+    for (const sel of selectors) {
+      const el = document.querySelector(sel);
+      if (el) {
+        const txt = cleanText(el.textContent);
+        if (txt) return txt;
+      }
+    }
+    return '';
+  }
+
+  function getRONumber() {
+    return getFieldText(RO_SELECTORS);
+  }
+
+  // $CNAME has the phone number jammed onto the end; strip a trailing
+  // run of digits/phone punctuation so the list shows just the name.
+  function cleanName(raw) {
+    return cleanText(raw).replace(/[\s\d()\-./]{7,}$/, '').trim();
+  }
+
+  function getCustomerName() {
+    return cleanName(getFieldText([CUSTOMER_SELECTOR]));
+  }
+
+  function getVehicleDesc() {
+    return getFieldText([VEHICLE_SELECTOR]);
+  }
+
+  function getWriterName() {
+    return getFieldText([WRITER_SELECTOR]);
+  }
+
+  // querySelector that also looks inside open shadow roots.
+  function deepQuery(root, selector) {
+    const hit = root.querySelector(selector);
+    if (hit) return hit;
+    for (const node of root.querySelectorAll('*')) {
+      if (node.shadowRoot) {
+        const found = deepQuery(node.shadowRoot, selector);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+
+  let storeEl = null;
+  let lastStoreScan = 0;
+
+  // The dealer label is in the app header, which may be a different (same-origin)
+  // frame than the RO screen, so search this frame and the top frame.
+  function findStoreEl() {
+    if (storeEl && storeEl.isConnected) return storeEl;
+    storeEl = null;
+    if (Date.now() - lastStoreScan < STORE_SCAN_MS) return null;
+    lastStoreScan = Date.now();
+
+    const docs = [document];
+    try {
+      if (window.top !== window && window.top.document) docs.push(window.top.document);
+    } catch (err) {
+      /* cross-origin top frame - ignore */
+    }
+    for (const d of docs) {
+      const hit = deepQuery(d, DEALER_SELECTOR);
+      if (hit) return (storeEl = hit);
+    }
+    return null;
+  }
+
+  // Current store name, e.g. "ELGIN HYUNDAI". Falls back to the last store seen
+  // in this browser (written by whichever frame can see the header).
+  function getStoreName() {
+    const node = findStoreEl();
+    const txt = node ? cleanText(node.textContent).replace(/\s+/g, ' ') : '';
+    if (txt) {
+      if (GM_getValue(STORE_KEY, '') !== txt) GM_setValue(STORE_KEY, txt);
+      return txt;
+    }
+    return cleanText(GM_getValue(STORE_KEY, '') || '');
+  }
+
+  function normWriter(str) {
+    return cleanText(str).replace(/\s+/g, ' ').toUpperCase();
+  }
+
+  // Map the (possibly truncated) on-screen writer text to an entry in
+  // SERVICE_WRITERS: exact match first, then a UNIQUE prefix match.
+  // Returns the advisor id, or null if unknown/ambiguous.
+  function matchWriterId(raw) {
+    const n = normWriter(raw);
+    if (!n) return null;
+    let hit = SERVICE_WRITERS.find((w) => normWriter(w.name) === n);
+    if (!hit) {
+      const candidates = SERVICE_WRITERS.filter((w) => normWriter(w.name).startsWith(n));
+      if (candidates.length === 1) hit = candidates[0];
+    }
+    return hit ? hit.id : null;
+  }
+
+  function writerLabel(raw) {
+    const id = matchWriterId(raw);
+    const w = SERVICE_WRITERS.find((x) => x.id === id);
+    return w ? w.name : raw;
+  }
+
+  function matchesWriterFilter(row) {
+    if (!filterWriter) return true;
+    const id = matchWriterId(row.writer);
+    return filterWriter === '__other__' ? id === null : id === filterWriter;
+  }
+
+  function parseDtdmsTimestamp(rawText) {
+    const text = cleanText(rawText);
+    const match = text.match(
+      /^[A-Za-z]{3}\s+(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})\s*(AM|PM)$/i
+    );
+    if (!match) return null;
+
+    const [, monthStr, dayStr, yearStr, hourStr, minuteStr, ampm] = match;
+    let hour = parseInt(hourStr, 10);
+    const minute = parseInt(minuteStr, 10);
+    const month = parseInt(monthStr, 10);
+    const day = parseInt(dayStr, 10);
+    const year = parseInt(yearStr, 10);
+
+    if (/pm/i.test(ampm) && hour !== 12) hour += 12;
+    if (/am/i.test(ampm) && hour === 12) hour = 0;
+
+    const d = new Date(year, month - 1, day, hour, minute, 0, 0);
+    return isNaN(d.getTime()) ? null : d.getTime();
+  }
+
+  function findEventLogOpenTimestamp() {
+    const grid = document.querySelector(EVENT_LOG_GRID_SELECTOR);
+    if (!grid) return null;
+
+    const descEls = grid.querySelectorAll('[id^="FADESC."]');
+    let earliest = null;
+
+    descEls.forEach((descEl) => {
+      const desc = cleanText(descEl.textContent).toLowerCase();
+      if (!desc.includes('repair order opened')) return;
+
+      const suffix = descEl.id.split('.')[1];
+      const dateEl = grid.querySelector(`[id="FADATE.${suffix}"]`);
+      if (!dateEl) return;
+
+      const ts = parseDtdmsTimestamp(dateEl.textContent);
+      if (ts !== null && (earliest === null || ts < earliest)) {
+        earliest = ts;
+      }
+    });
+
+    return earliest;
+  }
+
+  function blankData() {
+    return {
+      name: '',
+      notes: '',
+      promiseTime: '',
+      promiseDate: '',
+      checkInTime: null,
+      checkInSource: null,
+      archived: false,
+      archivedAt: null,
+      writer: '',
+      store: '',
+      updatedAt: 0,
+      updatedBy: '',
+    };
+  }
+
+  function loadData(roNumber) {
+    return Object.assign(blankData(), GM_getValue(STORAGE_PREFIX + roNumber, null) || {});
+  }
+
+  // Saves to the local cache AND queues only the fields that actually changed
+  // for upload, so people editing different fields of one RO never clobber each other.
+  function saveData(roNumber, data) {
+    const key = STORAGE_PREFIX + roNumber;
+    const prev = GM_getValue(key, null);
+    const norm = (v) => (v === undefined || v === null || v === false ? '' : v);
+    const patch = {};
+    SYNC_FIELDS.forEach((f) => {
+      if (prev) {
+        if (norm(prev[f]) !== norm(data[f])) patch[f] = data[f];
+      } else if (norm(data[f]) !== '') {
+        patch[f] = data[f]; // brand-new RO: send only real values, never blanks
+      }
+    });
+    GM_setValue(key, data);
+    if (syncEnabled() && Object.keys(patch).length) queuePatch(roNumber, patch);
+  }
+
+  // "HH:MM" (24h) -> "h:mm AM/PM"
+  function fmtTime(t) {
+    if (!t) return '--';
+    const parts = t.split(':').map(Number);
+    if (parts.length < 2 || parts.some(isNaN)) return t;
+    const ap = parts[0] >= 12 ? 'PM' : 'AM';
+    const h12 = parts[0] % 12 || 12;
+    return `${h12}:${String(parts[1]).padStart(2, '0')} ${ap}`;
+  }
+
+  // "YYYY-MM-DD" -> "MM/DD/YYYY"
+  function fmtDate(d) {
+    if (!d) return '--';
+    const p = d.split('-');
+    if (p.length !== 3) return d;
+    return `${p[1]}/${p[2]}/${p[0]}`;
+  }
+
+  // Small DOM builder that never touches innerHTML (safe with any page text).
+  function el(tag, text, css) {
+    const node = document.createElement(tag);
+    if (text !== undefined && text !== null) node.textContent = text;
+    if (css) node.style.cssText = css;
+    return node;
+  }
+
+  // ---------------------------------------------------------------------
+  // State
+  // ---------------------------------------------------------------------
+  let currentRO = null;
+  let currentData = null;
+  let saveTimer = null;
+  let activeView = 'ro'; // 'ro' | 'list' | 'archive'
+  let filterWriter = ''; // '' = all, an advisor id, or '__other__'
+  let roOnScreen = false; // true only while an RO number field is present on this screen
+  const dirtyFields = new Set(); // form fields the user has actually edited since the last save
+  const FORM_FIELDS = { notes: '#tm-notes', promiseTime: '#tm-promise-time', promiseDate: '#tm-promise-date' };
+  try {
+    filterWriter = GM_getValue(FILTER_KEY, '') || '';
+  } catch (err) {
+    /* ignore */
+  }
+
+  // ---------------------------------------------------------------------
+  // Panel UI
+  // ---------------------------------------------------------------------
+  function buildPanel() {
+    if (document.getElementById(PANEL_ID)) return document.getElementById(PANEL_ID);
+
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.style.cssText = `
+      position: fixed;
+      top: 90px;
+      left: 0;
+      z-index: 999999;
+      display: flex;
+      align-items: flex-start;
+      font-family: Arial, sans-serif;
+      font-size: 12px;
+    `;
+
+    panel.innerHTML = `
+      <div id="tm-ro-body" style="
+        width: ${NARROW_W};
+        background: #ffffff;
+        border: 1px solid #999;
+        border-left: none;
+        border-radius: 0 6px 6px 0;
+        box-shadow: 2px 2px 6px rgba(0,0,0,0.25);
+        padding: 10px;
+      ">
+        <div style="font-weight:bold; font-size:13px; margin-bottom:6px;">RO Notes &amp; Promise</div>
+
+        <div style="display:flex; gap:4px; margin-bottom:8px;">
+          <button id="tm-tab-ro" style="flex:1; padding:3px 6px; cursor:pointer;">Current RO</button>
+          <button id="tm-tab-list" style="flex:1; padding:3px 6px; cursor:pointer;">All ROs</button>
+          <button id="tm-tab-archive" style="flex:1; padding:3px 6px; cursor:pointer;">Archive</button>
+        </div>
+
+        <div id="tm-view-ro">
+          <div id="tm-ro-meta" style="color:#555; font-size:11px; margin-bottom:8px; line-height:1.4;"></div>
+
+          <label style="display:block; font-weight:bold; margin-bottom:2px;">Notes</label>
+          <textarea id="tm-notes" rows="4" style="width:100%; box-sizing:border-box; margin-bottom:8px; resize:vertical;"></textarea>
+
+          <div style="display:flex; gap:6px; margin-bottom:8px;">
+            <div style="flex:1;">
+              <label style="display:block; font-weight:bold;">Promise Time</label>
+              <input id="tm-promise-time" type="time" style="width:100%; box-sizing:border-box;" />
+            </div>
+            <div style="flex:1;">
+              <label style="display:block; font-weight:bold;">Promise Date</label>
+              <input id="tm-promise-date" type="date" style="width:100%; box-sizing:border-box;" />
+            </div>
+          </div>
+
+          <div style="margin-bottom:8px;">
+            <label style="display:block; font-weight:bold;">Wait Time <span id="tm-wait-source" style="font-weight:normal; color:#777;">(since check-in, auto)</span></label>
+            <div id="tm-wait-display" style="padding:3px 0; font-size:13px;">--</div>
+          </div>
+
+          <div style="display:flex; align-items:center; gap:8px;">
+            <button id="tm-save-btn" style="padding:4px 10px; cursor:pointer;">Save</button>
+            <span id="tm-save-msg" style="color:green; display:none;">Saved</span>
+          </div>
+        </div>
+
+        <div id="tm-list-wrap" style="display:none;">
+          <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+            <label for="tm-writer-filter" style="font-weight:bold; white-space:nowrap;">Service Writer</label>
+            <select id="tm-writer-filter" style="flex:1; min-width:0;"></select>
+          </div>
+          <div id="tm-view-list" style="max-height:60vh; overflow-y:auto;"></div>
+        </div>
+
+        <div id="tm-sync-bar" style="margin-top:8px; padding-top:6px; border-top:1px solid #ddd; font-size:11px; color:#555; display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px;">
+          <span id="tm-sync-dot" style="font-size:14px; line-height:1; color:#999;">&#9679;</span>
+          <span id="tm-sync-text" style="flex:1;"></span>
+          <button id="tm-sync-btn" title="Sync now" style="font-size:11px; padding:1px 6px; cursor:pointer;">Sync</button>
+          <button id="tm-user-btn" title="Change the name coworkers see" style="font-size:11px; padding:1px 6px; cursor:pointer;">Set your name</button>
+        </div>
+      </div>
+      <button id="tm-toggle-btn" title="Collapse/expand" style="
+        writing-mode: vertical-rl;
+        text-orientation: mixed;
+        padding: 10px 4px;
+        background: #333;
+        color: #fff;
+        border: none;
+        border-radius: 0 6px 6px 0;
+        cursor: pointer;
+        height: 100px;
+        align-self: flex-start;
+      ">RO Panel</button>
+    `;
+
+    document.body.appendChild(panel);
+
+    const body = panel.querySelector('#tm-ro-body');
+    panel.querySelector('#tm-toggle-btn').addEventListener('click', () => {
+      body.style.display = body.style.display === 'none' ? 'block' : 'none';
+    });
+
+    panel.querySelector('#tm-tab-ro').addEventListener('click', () => setView('ro'));
+    panel.querySelector('#tm-tab-list').addEventListener('click', () => setView('list'));
+    panel.querySelector('#tm-tab-archive').addEventListener('click', () => setView('archive'));
+
+    // Service writer filter dropdown
+    const sel = panel.querySelector('#tm-writer-filter');
+    const addOpt = (value, label) => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      sel.appendChild(o);
+    };
+    addOpt('', 'All service writers');
+    SERVICE_WRITERS.slice()
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+      .forEach((w) => addOpt(w.id, w.name));
+    addOpt('__other__', 'Other / unlisted');
+    if (!Array.from(sel.options).some((o) => o.value === filterWriter)) filterWriter = '';
+    sel.value = filterWriter;
+    sel.addEventListener('change', () => {
+      filterWriter = sel.value;
+      try {
+        GM_setValue(FILTER_KEY, filterWriter);
+      } catch (err) {
+        /* ignore */
+      }
+      refreshList();
+    });
+
+    const debouncedSave = () => {
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => doSave(false), 600);
+    };
+
+    panel.querySelector('#tm-notes').addEventListener('input', () => {
+      dirtyFields.add('notes');
+      debouncedSave();
+    });
+    panel.querySelector('#tm-promise-time').addEventListener('change', () => {
+      dirtyFields.add('promiseTime');
+      doSave(false);
+      updateWaitAndColor();
+    });
+    panel.querySelector('#tm-promise-date').addEventListener('change', () => {
+      dirtyFields.add('promiseDate');
+      doSave(false);
+      updateWaitAndColor();
+    });
+    panel.querySelector('#tm-save-btn').addEventListener('click', () => {
+      doSave(false);
+      syncNow();
+    });
+    panel.querySelector('#tm-sync-btn').addEventListener('click', () => syncNow());
+    panel.querySelector('#tm-user-btn').addEventListener('click', () => promptForName());
+
+    applyView(panel);
+    return panel;
+  }
+
+  // ---------------------------------------------------------------------
+  // Views (Current RO / All ROs / Archive)
+  // ---------------------------------------------------------------------
+  const TABS = { ro: '#tm-tab-ro', list: '#tm-tab-list', archive: '#tm-tab-archive' };
+
+  function applyView(panel) {
+    panel = panel || document.getElementById(PANEL_ID);
+    if (!panel) return;
+
+    const isRO = activeView === 'ro';
+    panel.querySelector('#tm-view-ro').style.display = isRO ? 'block' : 'none';
+    panel.querySelector('#tm-list-wrap').style.display = isRO ? 'none' : 'block';
+    panel.querySelector('#tm-ro-body').style.width = isRO ? NARROW_W : WIDE_W;
+
+    Object.keys(TABS).forEach((key) => {
+      const btn = panel.querySelector(TABS[key]);
+      btn.style.fontWeight = key === activeView ? 'bold' : 'normal';
+      btn.style.background = key === activeView ? '#ddd' : '';
+    });
+  }
+
+  function setView(view) {
+    activeView = view;
+    if (view !== 'ro') doSave(true); // flush pending edits so the lists are current
+    applyView();
+    updateWaitAndColor();
+    if (view === 'ro' && currentRO) renderMeta(currentRO); // reflect archive status
+    refreshList();
+  }
+
+  function refreshList() {
+    if (activeView !== 'ro') renderList(activeView);
+  }
+
+  // Archive / restore an RO without touching its notes or promise data.
+  function setArchived(roNumber, flag) {
+    const data = roNumber === currentRO && currentData ? currentData : loadData(roNumber);
+    data.archived = flag;
+    data.archivedAt = flag ? Date.now() : null;
+    saveData(roNumber, data);
+  }
+
+  // Epoch ms -> "MM/DD/YYYY"
+  function fmtStamp(ts) {
+    if (!ts) return '--';
+    const d = new Date(ts);
+    return `${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}/${d.getFullYear()}`;
+  }
+
+  // Collect stored ROs: archived === false -> active list, true -> archive.
+  function listAllROs(archived) {
+    let keys = [];
+    try {
+      keys = GM_listValues().filter((k) => k.startsWith(STORAGE_PREFIX));
+    } catch (err) {
+      console.error('[RO Panel] GM_listValues failed:', err);
+    }
+
+    const rows = keys
+      .map((k) => {
+        const d = GM_getValue(k, {}) || {};
+        const promiseTime = d.promiseTime || '';
+        const promiseDate = d.promiseDate || '';
+        let ts = null;
+        if (promiseDate && promiseTime) {
+          const dt = new Date(`${promiseDate}T${promiseTime}`);
+          if (!isNaN(dt.getTime())) ts = dt.getTime();
+        }
+        return {
+          ro: k.slice(STORAGE_PREFIX.length),
+          name: d.name || '',
+          promiseTime,
+          promiseDate,
+          ts,
+          archived: !!d.archived,
+          archivedAt: d.archivedAt || null,
+          writer: d.writer || '',
+          store: d.store || '',
+        };
+      })
+      .filter((r) => r.archived === archived)
+      .filter(matchesWriterFilter);
+
+    if (archived) {
+      // Most recently archived first.
+      rows.sort((a, b) => (b.archivedAt || 0) - (a.archivedAt || 0));
+    } else {
+      // RO number, least to greatest (numeric, so 99 comes before 100).
+      rows.sort((a, b) => {
+        const na = Number(a.ro);
+        const nb = Number(b.ro);
+        if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
+        return a.ro.localeCompare(b.ro, undefined, { numeric: true });
+      });
+    }
+    return rows;
+  }
+
+  function renderList(mode) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const isArchive = mode === 'archive';
+    const host = panel.querySelector('#tm-view-list');
+    host.textContent = '';
+
+    const rows = listAllROs(isArchive);
+
+    if (!rows.length) {
+      host.appendChild(
+        el(
+          'div',
+          filterWriter
+            ? 'No repair orders match this service writer.'
+            : isArchive
+            ? 'No archived repair orders.'
+            : 'No repair orders saved yet. Open an RO and it will appear here.',
+          'color:#777; padding:6px 0;'
+        )
+      );
+      return;
+    }
+
+    const table = el('table', null, 'width:100%; border-collapse:collapse; font-size:12px;');
+    const thead = el('thead');
+    const hr = el('tr');
+    const headers = ['RO #', 'Name', 'Promise Time', 'Promise Date'];
+    if (isArchive) headers.push('Archived');
+    headers.push('');
+    headers.forEach((h) => {
+      hr.appendChild(el('th', h, 'text-align:left; padding:3px 4px; border-bottom:2px solid #999; position:sticky; top:0; background:#ffffff;'));
+    });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+
+    const now = Date.now();
+    const tbody = el('tbody');
+
+    rows.forEach((r) => {
+      const overdue = !isArchive && r.ts !== null && r.ts < now;
+      const isCurrent = r.ro === currentRO;
+      const tr = el('tr', null, `border-bottom:1px solid #ddd; background:${overdue ? '#f8d0d0' : 'transparent'};`);
+      if (r.store) tr.title = r.store;
+
+      tr.appendChild(el('td', r.ro, `padding:3px 4px; white-space:nowrap; ${isCurrent ? 'font-weight:bold;' : ''}`));
+      tr.appendChild(el('td', r.name || '--', 'padding:3px 4px;'));
+      tr.appendChild(el('td', fmtTime(r.promiseTime), 'padding:3px 4px; white-space:nowrap;'));
+      tr.appendChild(el('td', fmtDate(r.promiseDate), 'padding:3px 4px; white-space:nowrap;'));
+      if (isArchive) tr.appendChild(el('td', fmtStamp(r.archivedAt), 'padding:3px 4px; white-space:nowrap;'));
+
+      const actionTd = el('td', null, 'padding:3px 4px; text-align:right;');
+      const btn = el('button', isArchive ? 'Restore' : 'Archive', 'cursor:pointer; font-size:11px; padding:1px 6px;');
+      btn.title = isArchive ? 'Move this RO back to the All ROs list' : 'Move this RO to the Archive tab';
+      btn.addEventListener('click', () => {
+        setArchived(r.ro, !isArchive);
+        renderList(mode);
+      });
+      actionTd.appendChild(btn);
+      tr.appendChild(actionTd);
+
+      tbody.appendChild(tr);
+    });
+
+    table.appendChild(tbody);
+    host.appendChild(table);
+    host.appendChild(
+      el(
+        'div',
+        `${rows.length} RO${rows.length === 1 ? '' : 's'}` + (isArchive ? '' : ' • red = past promise time'),
+        'color:#777; font-size:11px; padding-top:6px;'
+      )
+    );
+  }
+
+  // ---------------------------------------------------------------------
+  // Save / populate
+  // ---------------------------------------------------------------------
+  function doSave(silent) {
+    if (!currentRO) return;
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+
+    // Start from the current record and overwrite ONLY the fields the user actually
+    // edited, so a stale form value can never overwrite a coworker's newer change.
+    const data = Object.assign({}, currentData || loadData(currentRO));
+    dirtyFields.forEach((f) => {
+      const input = panel.querySelector(FORM_FIELDS[f]);
+      if (input) data[f] = input.value;
+    });
+    dirtyFields.clear();
+    clearTimeout(saveTimer);
+
+    saveData(currentRO, data);
+    currentData = data;
+
+    if (!silent) {
+      const msg = panel.querySelector('#tm-save-msg');
+      msg.style.display = 'inline';
+      setTimeout(() => (msg.style.display = 'none'), 1200);
+      refreshList();
+    }
+  }
+
+  // "9/23 2:15 PM"
+  function fmtWhen(ts) {
+    return new Date(ts).toLocaleString([], { month: 'numeric', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+
+  function renderMeta(roNumber) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const meta = panel.querySelector('#tm-ro-meta');
+    meta.textContent = '';
+    meta.appendChild(el('div', `RO #${roNumber}`));
+    const nm = (currentData && currentData.name) || getCustomerName();
+    const veh = getVehicleDesc();
+    if (nm) meta.appendChild(el('div', nm));
+    if (veh) meta.appendChild(el('div', veh));
+    if (currentData && currentData.store) {
+      meta.appendChild(el('div', 'Store: ' + currentData.store));
+    }
+    if (currentData && currentData.writer) {
+      meta.appendChild(el('div', 'Writer: ' + writerLabel(currentData.writer)));
+    }
+    if (currentData && currentData.archived) {
+      meta.appendChild(el('div', 'Archived', 'color:#a60; font-weight:bold;'));
+    }
+    if (currentData && currentData.updatedBy) {
+      const when = currentData.updatedAt ? ' • ' + fmtWhen(currentData.updatedAt) : '';
+      meta.appendChild(el('div', 'Last edit: ' + currentData.updatedBy + when, 'color:#777;'));
+    }
+  }
+
+  function populatePanel(roNumber) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+
+    const data = loadData(roNumber);
+
+    if (!data.checkInTime) {
+      data.checkInTime = Date.now();
+      data.checkInSource = 'firstSeen';
+    }
+
+    // Remember the customer name so the All ROs list can show it.
+    const nm = getCustomerName();
+    if (nm) data.name = nm;
+    const wr = getWriterName();
+    if (wr) data.writer = wr;
+    // An RO belongs to one store, so only fill it in once.
+    const st = getStoreName();
+    if (st && !data.store) data.store = st;
+
+    saveData(roNumber, data);
+    currentData = data;
+
+    panel.querySelector('#tm-notes').value = data.notes;
+    panel.querySelector('#tm-promise-time').value = data.promiseTime;
+    panel.querySelector('#tm-promise-date').value = data.promiseDate;
+
+    renderMeta(roNumber);
+    updateWaitAndColor();
+    refreshList();
+  }
+
+  // ---------------------------------------------------------------------
+  // Wait time display + promise-time background color
+  // ---------------------------------------------------------------------
+  function formatElapsed(ms) {
+    if (ms < 0) ms = 0;
+    const totalMinutes = Math.floor(ms / 60000);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours <= 0) return `${minutes}m`;
+    return `${hours}h ${minutes}m`;
+  }
+
+  function updateWaitAndColor() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel || !currentData) return;
+
+    const waitDisplay = panel.querySelector('#tm-wait-display');
+    const waitSource = panel.querySelector('#tm-wait-source');
+    if (waitDisplay) {
+      waitDisplay.textContent = currentData.checkInTime
+        ? formatElapsed(Date.now() - currentData.checkInTime)
+        : '--';
+    }
+    if (waitSource) {
+      waitSource.textContent =
+        currentData.checkInSource === 'eventlog'
+          ? '(from RO Event Log)'
+          : '(estimated - open Event Log to correct)';
+    }
+
+    const body = panel.querySelector('#tm-ro-body');
+    if (!body) return;
+
+    // Not inside a Repair Order (or looking at the All ROs / Archive lists): plain white.
+    if (!roOnScreen || activeView !== 'ro') {
+      body.style.background = '#ffffff';
+      return;
+    }
+
+    const promiseDateVal = panel.querySelector('#tm-promise-date').value;
+    const promiseTimeVal = panel.querySelector('#tm-promise-time').value;
+
+    if (!promiseDateVal || !promiseTimeVal) {
+      body.style.background = '#ffffff';
+      return;
+    }
+
+    const promiseDateTime = new Date(`${promiseDateVal}T${promiseTimeVal}`);
+    if (isNaN(promiseDateTime.getTime())) {
+      body.style.background = '#ffffff';
+      return;
+    }
+
+    body.style.background = Date.now() > promiseDateTime.getTime() ? '#f8d0d0' : '#d4f4d4';
+  }
+
+  // ---------------------------------------------------------------------
+  // Event Log correction (runs before any early return in tick)
+  // ---------------------------------------------------------------------
+  function applyEventLogCorrection() {
+    if (!currentRO || !currentData) return;
+    const ts = findEventLogOpenTimestamp();
+    if (ts !== null && ts !== currentData.checkInTime) {
+      currentData.checkInTime = ts;
+      currentData.checkInSource = 'eventlog';
+      saveData(currentRO, currentData);
+      updateWaitAndColor();
+      console.log('[RO Panel] Corrected check-in time from RO Event Log for RO', currentRO);
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Shared database sync (Google Apps Script + Google Sheet)
+  //
+  // Local GM storage stays as a fast cache. Every save is diffed against the
+  // cache and only the CHANGED fields go into an "outbox" that is uploaded to
+  // the server, which merges them field by field. A poll pulls coworkers'
+  // changes back into the cache and into the open panel.
+  // ---------------------------------------------------------------------
+  let syncBusy = false;
+  let resyncQueued = false;
+  let lastSync = 0; // server clock of the last successful pull (per frame on purpose)
+  let lastAttempt = 0;
+  let lastOkAt = 0;
+  let syncError = '';
+  let flushTimer = null;
+  let namePrompted = false;
+
+  function syncEnabled() {
+    return !!API_URL && !/^PASTE_/.test(API_URL);
+  }
+
+  function getUser() {
+    return cleanText(GM_getValue(USER_KEY, '') || '');
+  }
+
+  function promptForName() {
+    const n = prompt('Your name for the shared RO list (coworkers will see who last edited an RO):', getUser());
+    if (n !== null && cleanText(n)) GM_setValue(USER_KEY, cleanText(n).slice(0, 60));
+    renderSyncStatus();
+  }
+
+  // Cross-origin POST via the userscript manager (bypasses the page's CSP/CORS).
+  function api(action, payload) {
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: API_URL,
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        data: JSON.stringify(Object.assign({ action, user: getUser() || '(unknown)' }, API_KEY ? { key: API_KEY } : {}, payload || {})),
+        timeout: 25000,
+        anonymous: false, // send this browser's Google sign-in cookies (needed for "Anyone within <your domain>")
+        onload: (r) => {
+          if (/^\s*</.test(r.responseText || '')) {
+            // A web page (usually Google's sign-in page) instead of JSON.
+            reject(new Error('got a web page instead of data - sign in to your work Google account in this browser'));
+            return;
+          }
+          try {
+            const j = JSON.parse(r.responseText);
+            if (j && j.ok) resolve(j);
+            else reject(new Error((j && j.error) || 'server error'));
+          } catch (err) {
+            reject(new Error('bad response (HTTP ' + r.status + ')'));
+          }
+        },
+        onerror: () => reject(new Error('network error')),
+        ontimeout: () => reject(new Error('timed out')),
+      });
+    });
+  }
+
+  function getOutbox() {
+    return GM_getValue(OUTBOX_KEY, {}) || {};
+  }
+
+  function queuePatch(ro, patch) {
+    const box = getOutbox();
+    box[ro] = Object.assign(box[ro] || {}, patch);
+    GM_setValue(OUTBOX_KEY, box);
+    clearTimeout(flushTimer);
+    flushTimer = setTimeout(syncNow, 1500); // upload soon after an edit
+  }
+
+  // Upload queued changes; remove from the outbox only what was sent AND not edited since.
+  async function flushOutbox() {
+    const box = getOutbox();
+    const ros = Object.keys(box);
+    if (!ros.length) return;
+
+    const sent = ros.map((ro) => ({ ro, fields: Object.assign({}, box[ro]) }));
+    const res = await api('upsert', { patches: sent });
+
+    const cur = getOutbox();
+    sent.forEach(({ ro, fields }) => {
+      if (!cur[ro]) return;
+      Object.keys(fields).forEach((f) => {
+        if (cur[ro][f] === fields[f]) delete cur[ro][f];
+      });
+      if (!Object.keys(cur[ro]).length) delete cur[ro];
+    });
+    GM_setValue(OUTBOX_KEY, cur);
+
+    applyRemoteRows(res.rows);
+  }
+
+  // One-time: push this browser's pre-sharing data up (server only ADDS missing ROs).
+  async function migrateLocalOnce() {
+    if (GM_getValue(MIGRATED_KEY, false)) return;
+    const rows = [];
+    GM_listValues().forEach((k) => {
+      if (!k.startsWith(STORAGE_PREFIX)) return;
+      const d = GM_getValue(k, null);
+      if (!d) return;
+      const r = { ro: k.slice(STORAGE_PREFIX.length) };
+      SYNC_FIELDS.forEach((f) => (r[f] = d[f]));
+      rows.push(r);
+    });
+    if (rows.length) await api('import', { rows });
+    GM_setValue(MIGRATED_KEY, true);
+  }
+
+  // Bring the open panel in line with a newer server copy, without touching
+  // any field the user is in the middle of editing.
+  function adoptRemote(merged) {
+    currentData = Object.assign({}, merged);
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    Object.keys(FORM_FIELDS).forEach((f) => {
+      if (dirtyFields.has(f)) return;
+      const input = panel.querySelector(FORM_FIELDS[f]);
+      const val = merged[f] || '';
+      if (input && document.activeElement !== input && input.value !== val) input.value = val;
+    });
+    renderMeta(currentRO);
+    updateWaitAndColor();
+  }
+
+  // Merge server rows into the local cache. Fields with an un-uploaded local edit win.
+  function applyRemoteRows(rows) {
+    if (!rows || !rows.length) return;
+    const box = getOutbox();
+    rows.forEach((row) => {
+      const ro = String(row.ro);
+      const key = STORAGE_PREFIX + ro;
+      const stored = GM_getValue(key, null);
+      const pending = box[ro] || {};
+      const hasPending = Object.keys(pending).length > 0;
+
+      let merged;
+      if (stored && stored.updatedAt === row.updatedAt && !hasPending) {
+        merged = Object.assign(blankData(), stored); // cache already current
+      } else {
+        merged = Object.assign(blankData(), stored || {});
+        SYNC_FIELDS.forEach((f) => {
+          if (!(f in pending) && row[f] !== undefined) merged[f] = row[f];
+        });
+        merged.updatedAt = row.updatedAt;
+        merged.updatedBy = row.updatedBy;
+        GM_setValue(key, merged);
+      }
+
+      if (ro === currentRO && (!currentData || currentData.updatedAt !== merged.updatedAt)) {
+        adoptRemote(merged);
+      }
+    });
+  }
+
+  async function syncNow() {
+    if (!syncEnabled()) return;
+    if (syncBusy) {
+      resyncQueued = true;
+      return;
+    }
+    syncBusy = true;
+    lastAttempt = Date.now();
+    try {
+      await migrateLocalOnce();
+      await flushOutbox();
+      const res = await api('list', { since: Math.max(0, lastSync - 2000) });
+      applyRemoteRows(res.rows);
+      lastSync = res.now;
+      lastOkAt = Date.now();
+      syncError = '';
+      if (res.rows.length) refreshList();
+    } catch (err) {
+      syncError = err && err.message ? err.message : String(err);
+      console.warn('[RO Panel] sync failed:', syncError);
+    } finally {
+      syncBusy = false;
+      renderSyncStatus();
+      if (resyncQueued) {
+        resyncQueued = false;
+        setTimeout(syncNow, 500);
+      }
+    }
+  }
+
+  function renderSyncStatus() {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const dot = panel.querySelector('#tm-sync-dot');
+    const txt = panel.querySelector('#tm-sync-text');
+    const userBtn = panel.querySelector('#tm-user-btn');
+    if (!dot || !txt || !userBtn) return;
+
+    const pending = Object.keys(getOutbox()).length;
+    let color = '#999';
+    let text;
+    if (!syncEnabled()) {
+      text = 'Local only (sync not set up)';
+    } else if (syncError) {
+      color = '#c33';
+      text = /web page/.test(syncError)
+        ? `Sign in to your work Google account (${pending} waiting)`
+        : `Offline - ${pending} change${pending === 1 ? '' : 's'} waiting`;
+    } else if (!lastOkAt) {
+      color = '#e90';
+      text = 'Connecting...';
+    } else {
+      color = '#2a8';
+      const t = new Date(lastOkAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      text = `Synced ${t}` + (pending ? ` (${pending} pending)` : '');
+    }
+    dot.style.color = color;
+    txt.textContent = text;
+    txt.title = syncError || '';
+    const user = getUser();
+    userBtn.textContent = user ? 'You: ' + user : 'Set your name';
+  }
+
+  // ---------------------------------------------------------------------
+  // Main loop
+  // ---------------------------------------------------------------------
+  function tick() {
+    if (!document.body) return;
+
+    const existed = !!document.getElementById(PANEL_ID);
+    buildPanel();
+    // If the app wiped the panel, refill it so a blank form can't overwrite saved data.
+    if (!existed && currentRO) populatePanel(currentRO);
+
+    if (syncEnabled()) {
+      if (!getUser() && !namePrompted) {
+        namePrompted = true;
+        setTimeout(promptForName, 300);
+      }
+      if (!document.hidden && !syncBusy && Date.now() - lastAttempt > SYNC_MS) syncNow();
+    }
+    renderSyncStatus();
+
+    applyEventLogCorrection();
+
+    // Keep the "last store seen" up to date even on non-RO screens / the header frame.
+    const store = getStoreName();
+
+    const ro = getRONumber();
+    roOnScreen = !!ro;
+
+    if (!ro) {
+      updateWaitAndColor(); // leaving an RO -> back to white
+      if (!currentRO) {
+        const meta = document.querySelector(`#${PANEL_ID} #tm-ro-meta`);
+        if (meta) meta.textContent = 'No RO detected on this screen yet.';
+      }
+      return;
+    }
+
+    if (ro !== currentRO) {
+      if (currentRO) doSave(true);
+      currentRO = ro;
+      populatePanel(ro);
+      console.log('[RO Panel] Detected RO', ro);
+    } else {
+      // Customer/writer/store fields may render after the RO number (or change later).
+      if (currentData) {
+        const nm = getCustomerName();
+        const wr = getWriterName();
+        let changed = false;
+        if (nm && !currentData.name) {
+          currentData.name = nm;
+          changed = true;
+        }
+        if (wr && wr !== currentData.writer) {
+          currentData.writer = wr;
+          changed = true;
+        }
+        if (store && !currentData.store) {
+          currentData.store = store;
+          changed = true;
+        }
+        if (changed) {
+          saveData(currentRO, currentData);
+          renderMeta(currentRO);
+          refreshList();
+        }
+      }
+      updateWaitAndColor();
+    }
+  }
+
+  console.log('[RO Panel] Script loaded on', window.location.href);
+
+  setInterval(() => {
+    try {
+      tick();
+    } catch (err) {
+      console.error('[RO Panel] tick() error (suppressed):', err);
+    }
+  }, POLL_MS);
+
+  tick();
+})();
