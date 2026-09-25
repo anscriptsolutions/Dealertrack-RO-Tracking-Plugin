@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Dealertrack RO - Notes & Promise Time Panel
 // @namespace    https://www.dealertrackdms.app.coxautoinc.com/
-// @version      2.4
-// @description  Floating left-edge panel with Notes, Promise Time, Promise Date, Wait Time for the open RO, plus an "All ROs" list and an Archive tab (RO number, name, promise time, promise date), filterable by service writer. Shared between users through a Google Sheet backend. Records the store (dealer) each RO belongs to.
+// @version      2.5
+// @description  Floating left-edge panel with Notes, Promise Time, Promise Date, Wait Time for the open RO, plus an "All ROs" list and an Archive tab (RO number, name, promise time, promise date), filterable by service writer. Shared between users through a Google Sheet backend. Each store's ROs are unlocked with that store's password.
 // @match        https://*.dealertrackdms.app.coxautoinc.com/dtdms*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -36,7 +36,20 @@
   const USER_KEY = 'ro-panel-user';
   const OUTBOX_KEY = 'ro-panel-outbox';
   const MIGRATED_KEY = 'ro-panel-migrated';
-  const STORE_KEY = 'ro-panel-store'; // last store seen in this browser (shared across frames)
+  const STORE_KEY = 'ro-panel-unlocked-store'; // store this browser unlocked with a password
+
+  // Store passwords (not case-sensitive). The panel only shows ROs tagged with the
+  // unlocked store, and new ROs are tagged with it.
+  // NOTE: anyone who opens this script can read these, and every store's data is
+  // still synced to every browser - this keeps stores separate, it is not real security.
+  const STORES = [
+    { name: 'Elgin Hyundai', password: 'ELH' },
+    { name: 'Genesis of Elgin', password: 'GOE' },
+    { name: 'Michigan City Hyundai', password: 'MCH' },
+    { name: 'Michigan City Kia', password: 'MCK' },
+    { name: 'Michigan City Ford', password: 'MCF' },
+    { name: 'Hyundai of Goshen', password: 'HOG' },
+  ];
 
   const STORAGE_PREFIX = 'ro-extra-data-';
   const PANEL_ID = 'tm-ro-panel';
@@ -46,11 +59,6 @@
   const EVENT_LOG_GRID_SELECTOR = '[id="SD1525DA"]';
   const CUSTOMER_SELECTOR = '[id="$CNAME"]';
   const VEHICLE_SELECTOR = '[id="$VDESC"]';
-
-  // Store name in the app header (e.g. "ELGIN HYUNDAI"). It is rendered by a Lit
-  // web component, so it may live inside a shadow root and/or the top frame.
-  const DEALER_SELECTOR = '[data-testid="dealer-label"]';
-  const STORE_SCAN_MS = 5000; // how often to re-search for it when not found
 
   const NARROW_W = '260px';
   const WIDE_W = '460px';
@@ -122,53 +130,27 @@
     return getFieldText([WRITER_SELECTOR]);
   }
 
-  // querySelector that also looks inside open shadow roots.
-  function deepQuery(root, selector) {
-    const hit = root.querySelector(selector);
-    if (hit) return hit;
-    for (const node of root.querySelectorAll('*')) {
-      if (node.shadowRoot) {
-        const found = deepQuery(node.shadowRoot, selector);
-        if (found) return found;
-      }
-    }
-    return null;
+  // The store this browser has unlocked ('' = locked). Shared by all tabs/frames.
+  function getUnlockedStore() {
+    const s = cleanText(GM_getValue(STORE_KEY, '') || '');
+    return STORES.some((x) => x.name === s) ? s : '';
   }
 
-  let storeEl = null;
-  let lastStoreScan = 0;
-
-  // The dealer label is in the app header, which may be a different (same-origin)
-  // frame than the RO screen, so search this frame and the top frame.
-  function findStoreEl() {
-    if (storeEl && storeEl.isConnected) return storeEl;
-    storeEl = null;
-    if (Date.now() - lastStoreScan < STORE_SCAN_MS) return null;
-    lastStoreScan = Date.now();
-
-    const docs = [document];
-    try {
-      if (window.top !== window && window.top.document) docs.push(window.top.document);
-    } catch (err) {
-      /* cross-origin top frame - ignore */
-    }
-    for (const d of docs) {
-      const hit = deepQuery(d, DEALER_SELECTOR);
-      if (hit) return (storeEl = hit);
-    }
-    return null;
+  function storeForPassword(pw) {
+    const p = cleanText(pw).toUpperCase();
+    const hit = p && STORES.find((s) => s.password.toUpperCase() === p);
+    return hit ? hit.name : '';
   }
 
-  // Current store name, e.g. "ELGIN HYUNDAI". Falls back to the last store seen
-  // in this browser (written by whichever frame can see the header).
-  function getStoreName() {
-    const node = findStoreEl();
-    const txt = node ? cleanText(node.textContent).replace(/\s+/g, ' ') : '';
-    if (txt) {
-      if (GM_getValue(STORE_KEY, '') !== txt) GM_setValue(STORE_KEY, txt);
-      return txt;
-    }
-    return cleanText(GM_getValue(STORE_KEY, '') || '');
+  // Case/space-insensitive, so "ELGIN HYUNDAI" (saved by v2.3) matches "Elgin Hyundai".
+  function sameStore(a, b) {
+    return !!a && !!b && normStore(a) === normStore(b);
+  }
+
+  // An RO can be viewed if it isn't tagged yet (it gets tagged when opened) or
+  // it's tagged with the unlocked store.
+  function roAllowed(data) {
+    return !!activeStore && (!data.store || sameStore(data.store, activeStore));
   }
 
   function normWriter(str) {
@@ -205,12 +187,10 @@
     return cleanText(str).replace(/\s+/g, ' ').toUpperCase();
   }
 
-  // Lists show only the store you're in. ROs saved before store tracking (blank
-  // store) are still shown so they can be opened/archived; opening one tags it.
-  // If no store has been detected yet, everything is shown.
+  // Lists show only ROs tagged with the unlocked store. Untagged ROs (saved before
+  // store tracking) are hidden until someone opens them, which tags them.
   function matchesStoreFilter(row, store) {
-    if (!store || !row.store) return true;
-    return normStore(row.store) === normStore(store);
+    return sameStore(row.store, store);
   }
 
   function parseDtdmsTimestamp(rawText) {
@@ -332,7 +312,7 @@
   let activeView = 'ro'; // 'ro' | 'list' | 'archive'
   let filterWriter = ''; // '' = all, an advisor id, or '__other__'
   let roOnScreen = false; // true only while an RO number field is present on this screen
-  let lastListStore = null; // store the lists were last filtered by
+  let activeStore = getUnlockedStore(); // '' = locked
   const dirtyFields = new Set(); // form fields the user has actually edited since the last save
   const FORM_FIELDS = { notes: '#tm-notes', promiseTime: '#tm-promise-time', promiseDate: '#tm-promise-date' };
   try {
@@ -372,6 +352,21 @@
       ">
         <div style="font-weight:bold; font-size:13px; margin-bottom:6px;">RO Notes &amp; Promise</div>
 
+        <div id="tm-lock" style="display:none;">
+          <label for="tm-store-pw" style="display:block; margin-bottom:4px;">Enter your store password to see its repair orders.</label>
+          <div style="display:flex; gap:6px;">
+            <input id="tm-store-pw" type="password" autocomplete="off" style="flex:1; min-width:0;" />
+            <button id="tm-unlock-btn" style="padding:2px 8px; cursor:pointer;">Unlock</button>
+          </div>
+          <div id="tm-lock-msg" style="color:#c33; margin-top:4px; min-height:14px;"></div>
+        </div>
+
+        <div id="tm-unlocked">
+        <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px; font-size:11px;">
+          <span style="flex:1;">Store: <b id="tm-store-name"></b></span>
+          <button id="tm-switch-store" title="Lock the panel and enter a different store's password" style="font-size:11px; padding:1px 6px; cursor:pointer;">Switch store</button>
+        </div>
+
         <div style="display:flex; gap:4px; margin-bottom:8px;">
           <button id="tm-tab-ro" style="flex:1; padding:3px 6px; cursor:pointer;">Current RO</button>
           <button id="tm-tab-list" style="flex:1; padding:3px 6px; cursor:pointer;">All ROs</button>
@@ -380,6 +375,9 @@
 
         <div id="tm-view-ro">
           <div id="tm-ro-meta" style="color:#555; font-size:11px; margin-bottom:8px; line-height:1.4;"></div>
+          <div id="tm-ro-blocked" style="display:none; color:#a60; padding:4px 0;"></div>
+
+          <div id="tm-ro-form">
 
           <label style="display:block; font-weight:bold; margin-bottom:2px;">Notes</label>
           <textarea id="tm-notes" rows="4" style="width:100%; box-sizing:border-box; margin-bottom:8px; resize:vertical;"></textarea>
@@ -404,6 +402,7 @@
             <button id="tm-save-btn" style="padding:4px 10px; cursor:pointer;">Save</button>
             <span id="tm-save-msg" style="color:green; display:none;">Saved</span>
           </div>
+          </div>
         </div>
 
         <div id="tm-list-wrap" style="display:none;">
@@ -412,6 +411,7 @@
             <select id="tm-writer-filter" style="flex:1; min-width:0;"></select>
           </div>
           <div id="tm-view-list" style="max-height:60vh; overflow-y:auto;"></div>
+        </div>
         </div>
 
         <div id="tm-sync-bar" style="margin-top:8px; padding-top:6px; border-top:1px solid #ddd; font-size:11px; color:#555; display:flex; flex-wrap:wrap; align-items:center; gap:4px 6px;">
@@ -440,6 +440,28 @@
     const body = panel.querySelector('#tm-ro-body');
     panel.querySelector('#tm-toggle-btn').addEventListener('click', () => {
       body.style.display = body.style.display === 'none' ? 'block' : 'none';
+    });
+
+    const pw = panel.querySelector('#tm-store-pw');
+    const tryUnlock = () => {
+      const store = storeForPassword(pw.value);
+      pw.value = '';
+      if (!store) {
+        panel.querySelector('#tm-lock-msg').textContent = 'Wrong password.';
+        return;
+      }
+      panel.querySelector('#tm-lock-msg').textContent = '';
+      GM_setValue(STORE_KEY, store);
+      onStoreChanged();
+    };
+    panel.querySelector('#tm-unlock-btn').addEventListener('click', tryUnlock);
+    pw.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') tryUnlock();
+    });
+    panel.querySelector('#tm-switch-store').addEventListener('click', () => {
+      doSave(true); // don't lose an edit in progress
+      GM_setValue(STORE_KEY, '');
+      onStoreChanged();
     });
 
     panel.querySelector('#tm-tab-ro').addEventListener('click', () => setView('ro'));
@@ -510,16 +532,50 @@
     panel = panel || document.getElementById(PANEL_ID);
     if (!panel) return;
 
+    const locked = !activeStore;
+    panel.querySelector('#tm-lock').style.display = locked ? 'block' : 'none';
+    panel.querySelector('#tm-unlocked').style.display = locked ? 'none' : 'block';
+    panel.querySelector('#tm-store-name').textContent = activeStore;
+
     const isRO = activeView === 'ro';
     panel.querySelector('#tm-view-ro').style.display = isRO ? 'block' : 'none';
     panel.querySelector('#tm-list-wrap').style.display = isRO ? 'none' : 'block';
-    panel.querySelector('#tm-ro-body').style.width = isRO ? NARROW_W : WIDE_W;
+    panel.querySelector('#tm-ro-body').style.width = isRO || locked ? NARROW_W : WIDE_W;
+    if (locked) panel.querySelector('#tm-ro-body').style.background = '#ffffff';
 
     Object.keys(TABS).forEach((key) => {
       const btn = panel.querySelector(TABS[key]);
       btn.style.fontWeight = key === activeView ? 'bold' : 'normal';
       btn.style.background = key === activeView ? '#ddd' : '';
     });
+  }
+
+  // Show the notes/promise form, or a notice that the open RO belongs to another store.
+  function showRoForm(show, otherStore) {
+    const panel = document.getElementById(PANEL_ID);
+    if (!panel) return;
+    panel.querySelector('#tm-ro-form').style.display = show ? 'block' : 'none';
+    const blocked = panel.querySelector('#tm-ro-blocked');
+    blocked.style.display = show ? 'none' : 'block';
+    blocked.textContent = show ? '' : `This RO belongs to ${otherStore}. Switch store to view or edit it.`;
+  }
+
+  // Called after unlocking, switching store, or another tab changing the store.
+  function onStoreChanged() {
+    activeStore = getUnlockedStore();
+    // Forget the open RO; the next tick re-opens it and checks it against the new store.
+    clearTimeout(saveTimer);
+    dirtyFields.clear();
+    currentRO = null;
+    currentData = null;
+    const panel = document.getElementById(PANEL_ID);
+    if (panel) {
+      Object.values(FORM_FIELDS).forEach((sel) => (panel.querySelector(sel).value = ''));
+      panel.querySelector('#tm-ro-meta').textContent = '';
+      showRoForm(true);
+    }
+    applyView();
+    refreshList();
   }
 
   function setView(view) {
@@ -607,9 +663,10 @@
     const host = panel.querySelector('#tm-view-list');
     host.textContent = '';
 
-    const store = getStoreName();
+    const store = activeStore;
+    if (!store) return; // locked
     const rows = listAllROs(isArchive, store);
-    const storeNote = store ? ` for ${store}` : '';
+    const storeNote = ` for ${store}`;
 
     if (!rows.length) {
       host.appendChild(
@@ -645,7 +702,6 @@
       const overdue = !isArchive && r.ts !== null && r.ts < now;
       const isCurrent = r.ro === currentRO;
       const tr = el('tr', null, `border-bottom:1px solid #ddd; background:${overdue ? '#f8d0d0' : 'transparent'};`);
-      if (r.store) tr.title = r.store;
 
       tr.appendChild(el('td', r.ro, `padding:3px 4px; white-space:nowrap; ${isCurrent ? 'font-weight:bold;' : ''}`));
       tr.appendChild(el('td', r.name || '--', 'padding:3px 4px;'));
@@ -671,8 +727,7 @@
     host.appendChild(
       el(
         'div',
-        (store ? store + ' • ' : 'Store not detected - showing all stores • ') +
-          `${rows.length} RO${rows.length === 1 ? '' : 's'}` +
+        `${store} • ${rows.length} RO${rows.length === 1 ? '' : 's'}` +
           (isArchive ? '' : ' • red = past promise time'),
         'color:#777; font-size:11px; padding-top:6px;'
       )
@@ -683,7 +738,7 @@
   // Save / populate
   // ---------------------------------------------------------------------
   function doSave(silent) {
-    if (!currentRO) return;
+    if (!currentRO || !currentData) return; // no RO, or it belongs to another store
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
 
@@ -744,6 +799,17 @@
 
     const data = loadData(roNumber);
 
+    if (!roAllowed(data)) {
+      currentData = null;
+      Object.values(FORM_FIELDS).forEach((sel) => (panel.querySelector(sel).value = ''));
+      showRoForm(false, data.store);
+      renderMeta(roNumber);
+      updateWaitAndColor();
+      refreshList();
+      return;
+    }
+    showRoForm(true);
+
     if (!data.checkInTime) {
       data.checkInTime = Date.now();
       data.checkInSource = 'firstSeen';
@@ -754,9 +820,8 @@
     if (nm) data.name = nm;
     const wr = getWriterName();
     if (wr) data.writer = wr;
-    // An RO belongs to one store, so only fill it in once.
-    const st = getStoreName();
-    if (st && !data.store) data.store = st;
+    // Untagged ROs are claimed by the store that opens them first.
+    if (!data.store) data.store = activeStore;
 
     saveData(roNumber, data);
     currentData = data;
@@ -784,7 +849,12 @@
 
   function updateWaitAndColor() {
     const panel = document.getElementById(PANEL_ID);
-    if (!panel || !currentData) return;
+    if (!panel) return;
+    if (!currentData) {
+      // Locked, or the open RO belongs to another store: no colour.
+      panel.querySelector('#tm-ro-body').style.background = '#ffffff';
+      return;
+    }
 
     const waitDisplay = panel.querySelector('#tm-wait-display');
     const waitSource = panel.querySelector('#tm-wait-source');
@@ -955,9 +1025,15 @@
   // Bring the open panel in line with a newer server copy, without touching
   // any field the user is in the middle of editing.
   function adoptRemote(merged) {
+    // The RO turned out to belong to another store (e.g. someone there opened it first).
+    if (!roAllowed(merged)) {
+      if (currentData) populatePanel(currentRO); // switches to the "other store" notice
+      return;
+    }
     currentData = Object.assign({}, merged);
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
+    showRoForm(true);
     Object.keys(FORM_FIELDS).forEach((f) => {
       if (dirtyFields.has(f)) return;
       const input = panel.querySelector(FORM_FIELDS[f]);
@@ -1081,17 +1157,14 @@
     }
     renderSyncStatus();
 
-    applyEventLogCorrection();
-
-    // Keep the "last store seen" up to date even on non-RO screens / the header frame.
-    const store = getStoreName();
-    if (store !== lastListStore) {
-      lastListStore = store;
-      refreshList(); // switched stores -> re-filter the lists
-    }
+    // Another tab/frame may have unlocked or switched the store.
+    if (getUnlockedStore() !== activeStore) onStoreChanged();
 
     const ro = getRONumber();
     roOnScreen = !!ro;
+    if (!activeStore) return; // locked: nothing is shown or saved until a password is entered
+
+    applyEventLogCorrection();
 
     if (!ro) {
       updateWaitAndColor(); // leaving an RO -> back to white
@@ -1108,7 +1181,7 @@
       populatePanel(ro);
       console.log('[RO Panel] Detected RO', ro);
     } else {
-      // Customer/writer/store fields may render after the RO number (or change later).
+      // Customer/writer fields may render after the RO number (or change later).
       if (currentData) {
         const nm = getCustomerName();
         const wr = getWriterName();
@@ -1119,10 +1192,6 @@
         }
         if (wr && wr !== currentData.writer) {
           currentData.writer = wr;
-          changed = true;
-        }
-        if (store && !currentData.store) {
-          currentData.store = store;
           changed = true;
         }
         if (changed) {
