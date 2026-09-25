@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Dealertrack RO - Notes & Promise Time Panel
 // @namespace    https://www.dealertrackdms.app.coxautoinc.com/
-// @version      2.5
+// @version      2.7
 // @description  Floating left-edge panel with Notes, Promise Time, Promise Date, Wait Time for the open RO, plus an "All ROs" list and an Archive tab (RO number, name, promise time, promise date), filterable by service writer. Shared between users through a Google Sheet backend. Each store's ROs are unlocked with that store's password.
 // @match        https://*.dealertrackdms.app.coxautoinc.com/dtdms*
 // @grant        GM_setValue
@@ -68,26 +68,59 @@
   const WRITER_SELECTOR = '[id="$SWNAM"]';
   const FILTER_KEY = 'ro-panel-writer-filter'; // deliberately NOT under STORAGE_PREFIX
 
-  const SERVICE_WRITERS = [
-    { id: '629', name: 'ANDERSON, ROBIN' },
-    { id: '245', name: 'Almaraz, Alejandro' },
-    { id: '111', name: 'BDC AGENT' },
-    { id: '557', name: 'Benjamin Angarola' },
-    { id: '999', name: 'DTDMS SUPPORT' },
-    { id: '310', name: 'GRANADOS, ANDY' },
-    { id: '471', name: 'IDA SZYMASZEK' },
-    { id: '718', name: 'JOHNNY WALKER IV' },
-    { id: '336', name: 'JORGE QUEVEDO' },
-    { id: '181', name: 'JOSE REYNOSO' },
-    { id: '462', name: 'KC, ROHAN' },
-    { id: '472', name: 'Kamil Karpowicz' },
-    { id: '151', name: 'MCCARTHY, MICHAEL' },
-    { id: '589', name: 'NICOLUSSI, ANTHONY' },
-    { id: 'OFF', name: 'OFFICE' },
-    { id: '904', name: 'Oliver, Ben' },
-    { id: '680', name: 'Ryder, Shane' },
-    { id: '799', name: 'TIM OLSON' },
-  ];
+  // Service writers per store (keyed by the store name in STORES). A store with no
+  // list here gets no Service Writer filter in the All ROs / Archive tabs.
+  // "First Last" and "Last, First" both match either on-screen order.
+  // ids only need to be unique within a store (the DMS advisor number where known).
+  const STORE_WRITERS = {
+    'Elgin Hyundai': [
+      { id: '629', name: 'ANDERSON, ROBIN' },
+      { id: '245', name: 'Almaraz, Alejandro' },
+      { id: '111', name: 'BDC AGENT' },
+      { id: '557', name: 'Benjamin Angarola' },
+      { id: '999', name: 'DTDMS SUPPORT' },
+      { id: '310', name: 'GRANADOS, ANDY' },
+      { id: '471', name: 'IDA SZYMASZEK' },
+      { id: '718', name: 'JOHNNY WALKER IV' },
+      { id: '336', name: 'JORGE QUEVEDO' },
+      { id: '181', name: 'JOSE REYNOSO' },
+      { id: '462', name: 'KC, ROHAN' },
+      { id: '472', name: 'Kamil Karpowicz' },
+      { id: '151', name: 'MCCARTHY, MICHAEL' },
+      { id: '589', name: 'NICOLUSSI, ANTHONY' },
+      { id: 'OFF', name: 'OFFICE' },
+      { id: '904', name: 'Oliver, Ben' },
+      { id: '680', name: 'Ryder, Shane' },
+      { id: '799', name: 'TIM OLSON' },
+    ],
+    'Genesis of Elgin': [
+      { id: '472', name: 'Kamil Karpowicz' },
+      { id: 'LOSURIELLO', name: 'Theresa Losuriello' },
+      { id: '904', name: 'Oliver, Ben' },
+    ],
+    'Michigan City Hyundai': [
+      { id: 'CAREW', name: 'Zach Carew' },
+      { id: '904', name: 'Oliver, Ben' },
+    ],
+    'Michigan City Kia': [
+      { id: 'MOORE', name: 'Derek Moore' },
+      { id: 'BLADSEL', name: 'Billie Jo Bladsel' },
+      { id: 'SUNNY', name: 'Sunny' },
+      { id: '904', name: 'Oliver, Ben' },
+    ],
+    'Michigan City Ford': [
+      { id: 'ROSADA', name: 'Rick Rosada' },
+      { id: 'LEE', name: 'Alyssa Lee' },
+      { id: '904', name: 'Oliver, Ben' },
+    ],
+    'Hyundai of Goshen': [
+      { id: 'KRAMER', name: 'Jacob Kramer' },
+      { id: 'KHAMPHANH', name: 'Kadija Khamphanh' },
+      { id: 'CAMPBELL', name: 'Braxton Campbell' },
+      { id: 'AGUILERA', name: 'Jose Aguilera' },
+      { id: '904', name: 'Oliver, Ben' },
+    ],
+  };
 
   // ---------------------------------------------------------------------
   // Helpers
@@ -157,23 +190,43 @@
     return cleanText(str).replace(/\s+/g, ' ').toUpperCase();
   }
 
+  function storeWriters() {
+    return STORE_WRITERS[activeStore] || [];
+  }
+
   // Map the (possibly truncated) on-screen writer text to an entry in
-  // SERVICE_WRITERS: exact match first, then a UNIQUE prefix match.
+  // the unlocked store's writers: exact match first, then a UNIQUE prefix match.
   // Returns the advisor id, or null if unknown/ambiguous.
   function matchWriterId(raw) {
     const n = normWriter(raw);
     if (!n) return null;
-    let hit = SERVICE_WRITERS.find((w) => normWriter(w.name) === n);
+    const writers = storeWriters();
+    let hit = writers.find((w) => writerForms(w.name).includes(n));
     if (!hit) {
-      const candidates = SERVICE_WRITERS.filter((w) => normWriter(w.name).startsWith(n));
+      const candidates = writers.filter((w) => writerForms(w.name).some((f) => f.startsWith(n)));
       if (candidates.length === 1) hit = candidates[0];
     }
     return hit ? hit.id : null;
   }
 
+  // A listed name in both orders: "OLIVER, BEN" <-> "BEN OLIVER",
+  // "BILLIE JO BLADSEL" -> "BLADSEL, BILLIE JO" (last word taken as the surname).
+  function writerForms(name) {
+    const n = normWriter(name);
+    const forms = [n];
+    const comma = n.match(/^([^,]+),\s*(.+)$/);
+    if (comma) {
+      forms.push(`${comma[2]} ${comma[1]}`);
+    } else {
+      const parts = n.split(' ');
+      if (parts.length > 1) forms.push(`${parts[parts.length - 1]}, ${parts.slice(0, -1).join(' ')}`);
+    }
+    return forms;
+  }
+
   function writerLabel(raw) {
     const id = matchWriterId(raw);
-    const w = SERVICE_WRITERS.find((x) => x.id === id);
+    const w = storeWriters().find((x) => x.id === id);
     return w ? w.name : raw;
   }
 
@@ -406,7 +459,7 @@
         </div>
 
         <div id="tm-list-wrap" style="display:none;">
-          <div style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
+          <div id="tm-writer-row" style="display:flex; align-items:center; gap:6px; margin-bottom:6px;">
             <label for="tm-writer-filter" style="font-weight:bold; white-space:nowrap;">Service Writer</label>
             <select id="tm-writer-filter" style="flex:1; min-width:0;"></select>
           </div>
@@ -468,21 +521,9 @@
     panel.querySelector('#tm-tab-list').addEventListener('click', () => setView('list'));
     panel.querySelector('#tm-tab-archive').addEventListener('click', () => setView('archive'));
 
-    // Service writer filter dropdown
+    // Service writer filter dropdown (options depend on the store; see fillWriterFilter)
     const sel = panel.querySelector('#tm-writer-filter');
-    const addOpt = (value, label) => {
-      const o = document.createElement('option');
-      o.value = value;
-      o.textContent = label;
-      sel.appendChild(o);
-    };
-    addOpt('', 'All service writers');
-    SERVICE_WRITERS.slice()
-      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
-      .forEach((w) => addOpt(w.id, w.name));
-    addOpt('__other__', 'Other / unlisted');
-    if (!Array.from(sel.options).some((o) => o.value === filterWriter)) filterWriter = '';
-    sel.value = filterWriter;
+    fillWriterFilter(panel);
     sel.addEventListener('change', () => {
       filterWriter = sel.value;
       try {
@@ -521,6 +562,40 @@
 
     applyView(panel);
     return panel;
+  }
+
+  // Rebuild the Service Writer dropdown for the unlocked store. Stores without a
+  // writer list get no filter (and show every RO).
+  function fillWriterFilter(panel) {
+    panel = panel || document.getElementById(PANEL_ID);
+    if (!panel) return;
+    const sel = panel.querySelector('#tm-writer-filter');
+    const writers = storeWriters();
+    sel.textContent = '';
+    panel.querySelector('#tm-writer-row').style.display = writers.length ? 'flex' : 'none';
+
+    const addOpt = (value, label) => {
+      const o = document.createElement('option');
+      o.value = value;
+      o.textContent = label;
+      sel.appendChild(o);
+    };
+    addOpt('', 'All service writers');
+    writers
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }))
+      .forEach((w) => addOpt(w.id, w.name));
+    if (writers.length) addOpt('__other__', 'Other / unlisted');
+
+    // Restore the saved choice if this store has it (the saved value itself is kept,
+    // so switching to another store and back doesn't lose it).
+    try {
+      filterWriter = GM_getValue(FILTER_KEY, '') || '';
+    } catch (err) {
+      filterWriter = '';
+    }
+    if (!Array.from(sel.options).some((o) => o.value === filterWriter)) filterWriter = '';
+    sel.value = filterWriter;
   }
 
   // ---------------------------------------------------------------------
@@ -573,6 +648,7 @@
       Object.values(FORM_FIELDS).forEach((sel) => (panel.querySelector(sel).value = ''));
       panel.querySelector('#tm-ro-meta').textContent = '';
       showRoForm(true);
+      fillWriterFilter(panel);
     }
     applyView();
     refreshList();
