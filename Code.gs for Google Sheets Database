@@ -1,0 +1,271 @@
+/**
+ * RO Panel - shared database backend (Google Apps Script web app).
+ *
+ * Bind this script to a Google Sheet (Extensions > Apps Script), then
+ * Deploy > New deployment > Web app with
+ *     Execute as: Me
+ *     Who has access: Anyone within <your organization>
+ * Google sign-in is the only security: no key is needed. As a safety net, requests are
+ * rejected unless Google reports a signed-in organization user (see REQUIRE_ORG_LOGIN),
+ * so an accidental "Anyone" deployment fails closed instead of being open.
+ * The sheet ("ROs") is created automatically and holds one row per repair order.
+ *
+ * Merge rules (applied per FIELD, so two people editing different fields of the
+ * same RO never overwrite each other):
+ *   - name, writer, notes, promiseTime, promiseDate, archived, archivedAt:
+ *       last write wins.
+ *   - store: the first non-empty value is kept (an RO belongs to one store).
+ *       To correct it, edit the cell in the sheet directly.
+ *   - checkInTime/checkInSource: the first "firstSeen" stamp is kept; a real
+ *       "eventlog" time always replaces a "firstSeen" estimate.
+ */
+
+const REQUIRE_ORG_LOGIN = true; // set false only if you understand the risk and sign-in detection misbehaves
+const SHEET_NAME = 'ROs';
+// New columns go at the END so rows written by older versions still line up.
+const COLS = [
+  'ro', 'name', 'writer', 'notes', 'promiseTime', 'promiseDate',
+  'checkInTime', 'checkInSource', 'archived', 'archivedAt', 'updatedAt', 'updatedBy',
+  'store',
+];
+
+// Visiting the /exec URL in a browser should show this - handy for testing the deployment.
+function doGet() {
+  return ContentService.createTextOutput('RO panel API is running.');
+}
+
+function doPost(e) {
+  const lock = LockService.getScriptLock();
+  let locked = false;
+  try {
+    lock.waitLock(25000);
+    locked = true;
+
+    const req = JSON.parse(e.postData.contents);
+    if (REQUIRE_ORG_LOGIN && !Session.getActiveUser().getEmail()) {
+      return reply({ ok: false, error: 'not signed in to an organization Google account (deploy as Anyone within your organization)' });
+    }
+
+    const user = String(req.user || '(unknown)').slice(0, 60);
+    const props = PropertiesService.getScriptProperties();
+    const lastMod = Number(props.getProperty('lastMod') || 0);
+    // Taken after the lock and forced to increase, so every write gets a unique, ordered stamp.
+    const now = Math.max(Date.now(), lastMod + 1);
+
+    switch (req.action) {
+      case 'ping':
+        return reply({ ok: true, now });
+
+      case 'list': {
+        const since = Number(req.since) || 0;
+        // Cheap exit: nothing has been written since the client's last pull.
+        if (since >= lastMod) {
+          return reply({ ok: true, now, rows: [] });
+        }
+        const rows = readRows(getSheet()).filter((r) => r.updatedAt > since);
+        return reply({ ok: true, now, rows });
+      }
+
+      case 'upsert': {
+        const result = upsert(getSheet(), req.patches || [], user, now);
+        if (result.wrote) props.setProperty('lastMod', String(now));
+        return reply({ ok: true, now, rows: result.rows });
+      }
+
+      case 'import': {
+        const added = importRows(getSheet(), req.rows || [], user, now);
+        if (added) props.setProperty('lastMod', String(now));
+        return reply({ ok: true, now, added });
+      }
+
+      default:
+        return reply({ ok: false, error: 'unknown action' });
+    }
+  } catch (err) {
+    return reply({ ok: false, error: String(err) });
+  } finally {
+    if (locked) lock.releaseLock();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sheet access
+// ---------------------------------------------------------------------------
+function getSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sh = ss.getSheetByName(SHEET_NAME);
+  if (!sh) {
+    sh = ss.insertSheet(SHEET_NAME);
+    sh.getRange(1, 1, 1, COLS.length).setValues([COLS]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+    // Plain-text format everywhere so Sheets never turns "14:30" or "2026-09-23" into a date.
+    sh.getRange(1, 1, sh.getMaxRows(), COLS.length).setNumberFormat('@');
+  } else {
+    ensureColumns(sh);
+  }
+  return sh;
+}
+
+// Upgrades a sheet made by an older version: adds any missing columns + headers.
+function ensureColumns(sh) {
+  if (sh.getMaxColumns() < COLS.length) {
+    sh.insertColumnsAfter(sh.getMaxColumns(), COLS.length - sh.getMaxColumns());
+  }
+  const header = sh.getRange(1, 1, 1, COLS.length).getValues()[0];
+  for (let c = 0; c < COLS.length; c++) {
+    if (String(header[c]) === COLS[c]) continue;
+    if (header[c] !== '') throw new Error('Unexpected header "' + header[c] + '" in column ' + (c + 1) + ' of ' + SHEET_NAME);
+    sh.getRange(1, c + 1).setValue(COLS[c]).setFontWeight('bold');
+    sh.getRange(1, c + 1, sh.getMaxRows(), 1).setNumberFormat('@');
+  }
+}
+
+function readRows(sheet) {
+  const last = sheet.getLastRow();
+  if (last < 2) return [];
+  return sheet.getRange(2, 1, last - 1, COLS.length).getValues().map(decode);
+}
+
+function writeRows(sheet, startRow, values) {
+  const needed = startRow + values.length - 1;
+  if (needed > sheet.getMaxRows()) {
+    sheet.insertRowsAfter(sheet.getMaxRows(), needed - sheet.getMaxRows() + 200);
+  }
+  const rng = sheet.getRange(startRow, 1, values.length, COLS.length);
+  rng.setNumberFormat('@');
+  rng.setValues(values);
+}
+
+function blankRow(ro) {
+  return {
+    ro: ro, name: '', writer: '', notes: '', promiseTime: '', promiseDate: '',
+    checkInTime: null, checkInSource: null, archived: false, archivedAt: null,
+    updatedAt: 0, updatedBy: '', store: '',
+  };
+}
+
+function decode(v) {
+  const num = (x) => (x === '' || x === null || x === undefined ? null : Number(x));
+  return {
+    ro: String(v[0]),
+    name: String(v[1]),
+    writer: String(v[2]),
+    notes: String(v[3]),
+    promiseTime: String(v[4]),
+    promiseDate: String(v[5]),
+    checkInTime: num(v[6]),
+    checkInSource: String(v[7]) || null,
+    archived: String(v[8]).toUpperCase() === 'TRUE',
+    archivedAt: num(v[9]),
+    updatedAt: num(v[10]) || 0,
+    updatedBy: String(v[11]),
+    store: String(v[12]),
+  };
+}
+
+function encode(r) {
+  return [
+    r.ro, r.name, r.writer, r.notes, r.promiseTime, r.promiseDate,
+    r.checkInTime, r.checkInSource, r.archived ? 'TRUE' : 'FALSE', r.archivedAt,
+    r.updatedAt, r.updatedBy, r.store,
+  ].map((x) => (x === null || x === undefined ? '' : String(x)));
+}
+
+// ---------------------------------------------------------------------------
+// Merge logic
+// ---------------------------------------------------------------------------
+// Applies a partial update to a row. Returns true if anything actually changed.
+function applyPatch(row, f) {
+  let changed = false;
+  const set = (k, v) => {
+    if (row[k] !== v) { row[k] = v; changed = true; }
+  };
+
+  ['name', 'writer', 'notes', 'promiseTime', 'promiseDate'].forEach((k) => {
+    if (k in f) set(k, f[k] === null || f[k] === undefined ? '' : String(f[k]));
+  });
+  if ('archived' in f) set('archived', !!f.archived);
+  if ('archivedAt' in f) set('archivedAt', f.archivedAt === null || f.archivedAt === undefined ? null : Number(f.archivedAt));
+
+  // First store wins; a blank never clears it.
+  if ('store' in f && !row.store && f.store) set('store', String(f.store).trim().slice(0, 80));
+
+  if ('checkInTime' in f && f.checkInTime !== null && f.checkInTime !== undefined) {
+    const t = Number(f.checkInTime);
+    const src = f.checkInSource || row.checkInSource || 'firstSeen';
+    // First stamp wins; only a real Event Log time may replace an existing one.
+    if (row.checkInTime === null || src === 'eventlog') {
+      set('checkInTime', t);
+      set('checkInSource', src);
+    }
+  }
+  return changed;
+}
+
+// patches: [{ ro, fields: {...changed fields only...} }]
+function upsert(sheet, patches, user, now) {
+  const rows = readRows(sheet);
+  const existingCount = rows.length;
+  const index = Object.create(null);
+  rows.forEach((r, i) => { index[r.ro] = i; });
+
+  const changedExisting = [];
+  const result = [];
+  let wrote = false;
+
+  patches.forEach((p) => {
+    const ro = String(p.ro || '').trim();
+    if (!ro) return;
+    let i = index[ro];
+    let isNew = false;
+    if (i === undefined) {
+      i = rows.length;
+      index[ro] = i;
+      rows.push(blankRow(ro));
+      isNew = true;
+    }
+    const row = rows[i];
+    const changed = applyPatch(row, p.fields || {});
+    if (changed || isNew) {
+      row.updatedAt = now;
+      row.updatedBy = user;
+      if (!isNew && changedExisting.indexOf(i) === -1) changedExisting.push(i);
+      wrote = true;
+    }
+    result.push(row);
+  });
+
+  changedExisting.forEach((i) => writeRows(sheet, i + 2, [encode(rows[i])]));
+  if (rows.length > existingCount) {
+    writeRows(sheet, existingCount + 2, rows.slice(existingCount).map(encode));
+  }
+  return { rows: result, wrote: wrote };
+}
+
+// One-time migration: adds ROs that don't exist yet, never overwrites existing ones.
+function importRows(sheet, incoming, user, now) {
+  const rows = readRows(sheet);
+  const seen = Object.create(null);
+  rows.forEach((r) => { seen[r.ro] = true; });
+
+  const add = [];
+  incoming.forEach((inc) => {
+    const ro = String(inc.ro || '').trim();
+    if (!ro || seen[ro]) return;
+    seen[ro] = true;
+    const row = blankRow(ro);
+    applyPatch(row, inc);
+    row.updatedAt = now;
+    row.updatedBy = user;
+    add.push(row);
+  });
+
+  if (add.length) writeRows(sheet, rows.length + 2, add.map(encode));
+  return add.length;
+}
+
+function reply(obj) {
+  return ContentService
+    .createTextOutput(JSON.stringify(obj))
+    .setMimeType(ContentService.MimeType.JSON);
+}
